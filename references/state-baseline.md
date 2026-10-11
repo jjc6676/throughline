@@ -3,8 +3,8 @@
 
 Which interaction states a component owes. This is the one list both checks read:
 `verify:check` (`state-incomplete`) reads it from `scripts/lib/component-states.mjs`,
-and `figma-executor` (its state check and the `focus-indicator` check) reads
-this table. CI fails when the table is stale.
+and the Figma checks script (`references/figma-checks.md`) inlines the same module,
+so this table is the human-readable view of both. CI fails when it is stale.
 
 A component name matches a row when it folds (lowercase, punctuation and spaces
 stripped) to exactly one of that row's names. `Text Field` folds to `textfield`.
@@ -17,7 +17,9 @@ matches nothing owes no states.
 | input | `input`, `textfield`, `textinput` | `hover`, `focus`, `disabled` |
 | choice | `checkbox`, `radio`, `toggle`, `switch`, `chip` | `hover`, `focus`, `active`, `selected`, `disabled` |
 
-Every state in the table must be a value on the component's `state` axis. On the
+Every state in the table must be a value on the component's `state` axis, with one
+exception in Figma: a choice control may carry `selected` on its own axis named
+`selected`, `checked` or `on`. On the
 Figma side the matrix also carries `default` as the resting state; the CLI does not
 count it. `checked` counts as `selected`, and `on` counts as `selected`, since that is what shadcn and Radix call it. Conditional states (`loading`, `error`, `success`) are not in the table:
 whether one applies is a design judgment.

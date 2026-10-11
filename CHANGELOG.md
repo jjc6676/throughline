@@ -6,6 +6,45 @@ to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.23.0] — 2026-10-11
+
+The three Figma checks that can stop a build used to be paragraphs the model
+rewrote every run, in three places, with no test. Now they're one script, built
+from tested code, and both the executor and the inline build run it as written.
+The first live run on the sample file found a rule that was wrong, and it was
+0.22.0's: a Checkbox that keeps "checked" on its own axis failed for a state it
+had. That's fixed here too.
+
+### Breaking
+
+- **Figma builds are now checked against what was built, not only the spec.**
+  After a component build, the executor and the inline path read the set back and
+  fail it unless its variant combinations are exactly the spec's matrix (axis
+  names and values compared ignoring case and punctuation), its state axis holds
+  every state the table owes plus `default`, and every focus variant carries its
+  framework's ring. A deliberately sparse set now fails, as it did under the old
+  count check. A build that drifted from its spec used to pass if the spec was
+  right.
+
+### Fixed
+
+- **A choice control can carry `selected` on its own axis in Figma.** 0.22.0
+  required a `selected` value on the `state` axis, so a Checkbox or Switch built
+  with a separate `checked: false | true` axis, as the sample file's are, failed
+  the state check. An axis named `selected`, `checked` or `on` now satisfies it.
+  Found in the live run.
+
+### Changed
+
+- **The Figma stop conditions are one committed script.** The COMPONENT_SET,
+  state and focus checks used to be prose the model rewrote every run, in three
+  places. They're now `references/figma-checks.md`, generated from a pure checker
+  (`scripts/lib/figma-checks.mjs`, with a fixture per recipe branch) and the state
+  table, and CI fails when it goes stale. The architect's spec gains a
+  `controlLayer` for wrapped controls such as an Input with a label. Only the
+  `shadcn` recipe has been run against a live Figma file; `mui`, `vanilla-css`,
+  `tailwind` and the skip path are tested on hand-written fixtures only.
+
 ## [0.22.0] — 2026-10-07
 
 Two checks decided which states a component owes, and they disagreed. A Switch
@@ -1593,7 +1632,8 @@ components → Storybook on a pnpm + Turborepo + Next.js 16 + Tailwind v4 monore
 - Reference docs for coding level, manifest schema, sync adapters, Figma
   component standards, and brainstorm-before-build.
 
-[Unreleased]: https://github.com/jrpease/throughline/compare/v0.22.0...HEAD
+[Unreleased]: https://github.com/jrpease/throughline/compare/v0.23.0...HEAD
+[0.23.0]: https://github.com/jrpease/throughline/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/jrpease/throughline/compare/v0.21.4...v0.22.0
 [0.21.4]: https://github.com/jrpease/throughline/compare/v0.21.3...v0.21.4
 [0.21.3]: https://github.com/jrpease/throughline/compare/v0.21.2...v0.21.3
