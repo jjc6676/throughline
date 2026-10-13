@@ -9,7 +9,7 @@
 // The state table is not imported. `withTable({ resolveArchetype, BASELINE_STATES,
 // STATE_SYNONYMS, normalizeName, contrastRatio, composite, parseHex, AA_NON_TEXT })`
 // takes it, the fold and the contrast maths from the caller and returns
-// { checkSpec, checkBuilt }. In the generated script the caller passes the
+// { checkSpec, checkBuilt, checkExisting }. In the generated script the caller passes the
 // inlined component-states.mjs names; in tests it passes the module's own exports.
 //
 // Spec: docs/specs/2026-10-07-figma-checks-as-scripts.md
@@ -46,7 +46,8 @@
 //
 // RESULT: { pass, checks: [{ name, result: 'pass' | 'fail' | 'skip', detail }] }
 //   built mode returns four checks: structural-read-back, state-baseline,
-//   focus-indicator, focus-contrast.
+//   focus-indicator, focus-contrast. existing mode (a set already in the library,
+//   docs/specs/2026-10-13-figma-adherence-gate.md) returns the last three.
 //   `pass` ignores skips. A failed assertion is data; nothing here throws.
 
 // The in-scope `uiFramework` values and the focus recipe each one uses. An absent or
@@ -281,7 +282,7 @@ export function withTable({
       return {
         name,
         result: 'skip',
-        detail: 'no surfaces named; the architect names the colour variables of the surfaces the component sits on',
+        detail: 'no surfaces named; name the colour variables of the surfaces the component sits on (from the architect spec, or ask the user)',
       };
     }
     const missing = snapshot.missingSurfaces ?? [];
@@ -369,9 +370,11 @@ export function withTable({
     return result([stateBaseline(expect, entries)]);
   }
 
+  const variantEntries = (snapshot) => (snapshot.children ?? []).flatMap((c) => Object.entries(c.variantProperties ?? {}));
+
   // After the build: the node as read.
   function checkBuilt(snapshot, expect) {
-    const entries = (snapshot.children ?? []).flatMap((c) => Object.entries(c.variantProperties ?? {}));
+    const entries = variantEntries(snapshot);
     const indicator = focusIndicator(snapshot, expect);
     return result([
       structural(snapshot, expect),
@@ -381,5 +384,13 @@ export function withTable({
     ]);
   }
 
-  return { checkSpec, checkBuilt };
+  // An existing set has no spec matrix, so the structural check is not run; the
+  // other three read only the set itself.
+  function checkExisting(snapshot, expect) {
+    const entries = variantEntries(snapshot);
+    const indicator = focusIndicator(snapshot, expect);
+    return result([stateBaseline(expect, entries), indicator, focusContrast(snapshot, expect, indicator)]);
+  }
+
+  return { checkSpec, checkBuilt, checkExisting };
 }

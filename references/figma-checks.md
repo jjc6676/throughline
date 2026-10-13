@@ -24,7 +24,7 @@ these checks by hand.
      component sits on, copied from the architect's spec. Without it the
      focus-contrast check is skipped. Surfaces are looked up among the file's
      local variables only.
-   - `const MODE = 'spec'` or `'built'`.
+   - `const MODE = 'spec'`, `'built'` or `'existing'`.
 2. End the script with `return await runFigmaChecks(EXPECT, MODE);` and pass
    `timeout: 30000`.
 3. Read the result, `{ pass, checks: [{ name, result, detail }] }`. `result` is
@@ -38,6 +38,18 @@ these checks by hand.
    COMPONENT_SET inside the frame named `WIP: <name>` on the current page and runs
    in the self-verify loop. It throws only if that frame is missing; a frame with
    no set, or a set Figma reports as conflicting, fails the structural check.
+5. `'existing'` checks a set already in the library, read-only: the first
+   COMPONENT_SET whose name matches `name` ignoring case and punctuation. Add
+   `page` to `EXPECT` (the page holding the components) so only that page is
+   loaded; without it every page loads in turn, which on a large file can stall
+   the bridge. `matrix` is not needed. There is no spec to copy `controlLayer` and
+   `surfaces` from, so the caller names them: `surfaces` as for a build, and
+   `controlLayer` for a wrapped control whose ring sits on an inner layer (without
+   it, a correct ring on an inner layer reads as missing). It runs the state,
+   focus-ring and focus-contrast checks against the set's own variants, not the
+   structural check. A set whose focus state is drawn some other way, such as an
+   INSIDE stroke, fails the focus-ring check and skips contrast. It throws when no
+   set has that name.
 
 ```js
 const EXPECT = { name: 'Chip', matrix: { state: ['default', 'hover'] }, uiFramework: 'shadcn' };
@@ -259,7 +271,7 @@ function composite(fgHex, bgHex) {
 // The state table is not imported. `withTable({ resolveArchetype, BASELINE_STATES,
 // STATE_SYNONYMS, normalizeName, contrastRatio, composite, parseHex, AA_NON_TEXT })`
 // takes it, the fold and the contrast maths from the caller and returns
-// { checkSpec, checkBuilt }. In the generated script the caller passes the
+// { checkSpec, checkBuilt, checkExisting }. In the generated script the caller passes the
 // inlined component-states.mjs names; in tests it passes the module's own exports.
 //
 // Spec: docs/specs/2026-10-07-figma-checks-as-scripts.md
@@ -296,7 +308,8 @@ function composite(fgHex, bgHex) {
 //
 // RESULT: { pass, checks: [{ name, result: 'pass' | 'fail' | 'skip', detail }] }
 //   built mode returns four checks: structural-read-back, state-baseline,
-//   focus-indicator, focus-contrast.
+//   focus-indicator, focus-contrast. existing mode (a set already in the library,
+//   docs/specs/2026-10-13-figma-adherence-gate.md) returns the last three.
 //   `pass` ignores skips. A failed assertion is data; nothing here throws.
 
 // The in-scope `uiFramework` values and the focus recipe each one uses. An absent or
@@ -531,7 +544,7 @@ function withTable({
       return {
         name,
         result: 'skip',
-        detail: 'no surfaces named; the architect names the colour variables of the surfaces the component sits on',
+        detail: 'no surfaces named; name the colour variables of the surfaces the component sits on (from the architect spec, or ask the user)',
       };
     }
     const missing = snapshot.missingSurfaces ?? [];
@@ -619,9 +632,11 @@ function withTable({
     return result([stateBaseline(expect, entries)]);
   }
 
+  const variantEntries = (snapshot) => (snapshot.children ?? []).flatMap((c) => Object.entries(c.variantProperties ?? {}));
+
   // After the build: the node as read.
   function checkBuilt(snapshot, expect) {
-    const entries = (snapshot.children ?? []).flatMap((c) => Object.entries(c.variantProperties ?? {}));
+    const entries = variantEntries(snapshot);
     const indicator = focusIndicator(snapshot, expect);
     return result([
       structural(snapshot, expect),
@@ -631,38 +646,27 @@ function withTable({
     ]);
   }
 
-  return { checkSpec, checkBuilt };
+  // An existing set has no spec matrix, so the structural check is not run; the
+  // other three read only the set itself.
+  function checkExisting(snapshot, expect) {
+    const entries = variantEntries(snapshot);
+    const indicator = focusIndicator(snapshot, expect);
+    return result([stateBaseline(expect, entries), indicator, focusContrast(snapshot, expect, indicator)]);
+  }
+
+  return { checkSpec, checkBuilt, checkExisting };
 }
 
-const { checkSpec, checkBuilt } = withTable({ resolveArchetype, BASELINE_STATES, STATE_SYNONYMS, normalizeName, contrastRatio, composite, parseHex, AA_NON_TEXT });
+const { checkSpec, checkBuilt, checkExisting } = withTable({ resolveArchetype, BASELINE_STATES, STATE_SYNONYMS, normalizeName, contrastRatio, composite, parseHex, AA_NON_TEXT });
 
-// Figma plugin-API reader for the stop-condition checks. This file is NOT a
-// Node module — build-figma-checks.mjs concatenates it after the inlined
-// component-states.mjs, contrast.mjs and figma-checks.mjs into
-// references/figma-checks.md, and
-// the result runs inside figma_execute (dynamic-page mode). Constraints honored
-// here (see references/figma-scripting.md): async getters only, variable names
-// and per-mode colour values resolved with getVariableByIdAsync and only for
-// focus variants and their controlLayer, plus the EXPECT.surfaces names, which
-// are looked up among the file's LOCAL colour variables only (a surface from a
-// published library reads as missing). Untested in Node, like the doc-card
-// renderer; the pure checker it feeds is unit-tested.
-//
-// In-scope globals when assembled: normalizeName (inlined
-// component-states.mjs), checkSpec, checkBuilt (bound from withTable) and the
-// caller-filled slots EXPECT and MODE (passed to runFigmaChecks). The snapshot
-// shape is documented at the top of scripts/lib/figma-checks.mjs.
+// Figma plugin-API helpers for reading colour variables, shared by the Figma
+// checks reader and the screen reader. This file is NOT a Node module:
+// build-figma-checks.mjs inlines it into both generated scripts
+// (references/figma-checks.md, references/figma-adherence.md). It depends on
+// nothing else, so it carries its own mode-name fold. Async getters only
+// (references/figma-scripting.md). Untested in Node, like the readers.
 
-// Colour variables read on focus nodes, by name, for the contrast check.
-const readVariables = new Map();
-
-async function variableName(alias) {
-  if (!alias || !alias.id) return null;
-  const variable = await figma.variables.getVariableByIdAsync(alias.id);
-  if (!variable) return null;
-  if (variable.resolvedType === 'COLOR') readVariables.set(variable.name, variable);
-  return variable.name;
-}
+const foldModeName = (s) => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
 
 function colorHex(value) {
   if (!value || typeof value !== 'object' || !('r' in value)) return null;
@@ -677,7 +681,7 @@ async function resolveColor(variable, modeName, hops) {
   if (!variable || hops > 10) return null;
   const collection = await figma.variables.getVariableCollectionByIdAsync(variable.variableCollectionId);
   if (!collection) return null;
-  const mode = collection.modes.find((m) => normalizeName(m.name) === normalizeName(modeName));
+  const mode = collection.modes.find((m) => foldModeName(m.name) === foldModeName(modeName));
   const value = variable.valuesByMode[mode ? mode.modeId : collection.defaultModeId];
   if (value && value.type === 'VARIABLE_ALIAS') {
     return resolveColor(await figma.variables.getVariableByIdAsync(value.id), modeName, hops + 1);
@@ -693,6 +697,35 @@ async function variableColors(variable) {
   for (const mode of collection.modes) modes[mode.name] = await resolveColor(variable, mode.name, 0);
   const fallback = collection.modes.find((m) => m.modeId === collection.defaultModeId);
   return { modes, defaultMode: fallback ? fallback.name : undefined };
+}
+
+// Figma plugin-API reader for the stop-condition checks. This file is NOT a
+// Node module — build-figma-checks.mjs concatenates it after the inlined
+// component-states.mjs, contrast.mjs, figma-checks.mjs and
+// figma-variables-read.figma.js into references/figma-checks.md, and
+// the result runs inside figma_execute (dynamic-page mode). Constraints honored
+// here (see references/figma-scripting.md): async getters only, variable names
+// and per-mode colour values resolved with getVariableByIdAsync and only for
+// focus variants and their controlLayer, plus the EXPECT.surfaces names, which
+// are looked up among the file's LOCAL colour variables only (a surface from a
+// published library reads as missing). Untested in Node, like the doc-card
+// renderer; the pure checker it feeds is unit-tested.
+//
+// In-scope globals when assembled: normalizeName (inlined
+// component-states.mjs), variableColors (figma-variables-read.figma.js),
+// checkSpec, checkBuilt, checkExisting (bound from withTable) and the
+// caller-filled slots EXPECT and MODE (passed to runFigmaChecks). The snapshot
+// shape is documented at the top of scripts/lib/figma-checks.mjs.
+
+// Colour variables read on focus nodes, by name, for the contrast check.
+const readVariables = new Map();
+
+async function variableName(alias) {
+  if (!alias || !alias.id) return null;
+  const variable = await figma.variables.getVariableByIdAsync(alias.id);
+  if (!variable) return null;
+  if (variable.resolvedType === 'COLOR') readVariables.set(variable.name, variable);
+  return variable.name;
 }
 
 // The fields the focus check reads from a variant, a control layer or a direct child.
@@ -752,19 +785,45 @@ function groupProperties(set) {
   }
 }
 
-async function readComponentSet(expect) {
-  readVariables.clear();
+// The set a build just made: the COMPONENT_SET in the `WIP: <name>` frame on the
+// current page. A frame holding plain FRAMEs where the set should be is a failed
+// assertion, not a missing target, so it comes back as `{ empty }` for the
+// structural check to name.
+async function findWipSet(expect) {
   await figma.currentPage.loadAsync();
   const frameName = `WIP: ${expect.name}`;
   const frame = figma.currentPage.findOne((n) => n.name === frameName);
   if (!frame) throw new Error(`no node named "${frameName}" on the current page`);
   const set = frame.type === 'COMPONENT_SET' ? frame : (frame.children || []).find((c) => c.type === 'COMPONENT_SET');
-  // A frame holding plain FRAMEs where the set should be is a failed assertion,
-  // not a missing target: report what is there so the structural check names it.
-  if (!set) {
-    const first = (frame.children || [])[0];
-    return { type: first ? first.type : 'NONE', variantGroupProperties: {}, children: [] };
+  if (set) return { set };
+  const first = (frame.children || [])[0];
+  return { empty: { type: first ? first.type : 'NONE', variantGroupProperties: {}, children: [] } };
+}
+
+// A set already in the library: the first COMPONENT_SET whose name folds to the
+// same name. With `pageName`, only that page is loaded (exact name, or a unique
+// match on the trimmed name). Without it every page is loaded in turn until one
+// has the set, which on a miss is the whole file; a whole-file load stalled the
+// bridge on a large file, so callers pass the page.
+async function findExistingSet(name, pageName) {
+  const want = normalizeName(name);
+  let pages = figma.root.children;
+  if (pageName !== undefined && pageName !== null) {
+    const exact = pages.filter((p) => p.name === pageName);
+    const trimmed = pages.filter((p) => p.name.trim() === String(pageName).trim());
+    pages = exact.length ? exact : trimmed.length === 1 ? trimmed : [];
+    if (!pages.length) throw new Error(`no page named "${pageName}"`);
   }
+  for (const page of pages) {
+    await page.loadAsync();
+    const set = page.findAllWithCriteria({ types: ['COMPONENT_SET'] }).find((s) => normalizeName(s.name) === want);
+    if (set) return set;
+  }
+  throw new Error(`no component set named "${name}"${pageName ? ` on page "${pageName}"` : ' in this file'}`);
+}
+
+async function readSet(set, expect) {
+  readVariables.clear();
 
   const isFocusState = (props) =>
     Object.entries(props || {}).some(([k, v]) => {
@@ -807,7 +866,11 @@ async function readComponentSet(expect) {
 
 async function runFigmaChecks(EXPECT, MODE) {
   if (MODE === 'spec') return checkSpec(EXPECT);
-  if (MODE === 'built') return checkBuilt(await readComponentSet(EXPECT), EXPECT);
-  throw new Error(`MODE must be 'spec' or 'built', got ${JSON.stringify(MODE)}`);
+  if (MODE === 'built') {
+    const { set, empty } = await findWipSet(EXPECT);
+    return checkBuilt(set ? await readSet(set, EXPECT) : empty, EXPECT);
+  }
+  if (MODE === 'existing') return checkExisting(await readSet(await findExistingSet(EXPECT.name, EXPECT.page), EXPECT), EXPECT);
+  throw new Error(`MODE must be 'spec', 'built' or 'existing', got ${JSON.stringify(MODE)}`);
 }
 ```

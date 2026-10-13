@@ -1,7 +1,7 @@
 // Figma plugin-API reader for the stop-condition checks. This file is NOT a
 // Node module — build-figma-checks.mjs concatenates it after the inlined
-// component-states.mjs, contrast.mjs and figma-checks.mjs into
-// references/figma-checks.md, and
+// component-states.mjs, contrast.mjs, figma-checks.mjs and
+// figma-variables-read.figma.js into references/figma-checks.md, and
 // the result runs inside figma_execute (dynamic-page mode). Constraints honored
 // here (see references/figma-scripting.md): async getters only, variable names
 // and per-mode colour values resolved with getVariableByIdAsync and only for
@@ -11,7 +11,8 @@
 // renderer; the pure checker it feeds is unit-tested.
 //
 // In-scope globals when assembled: normalizeName (inlined
-// component-states.mjs), checkSpec, checkBuilt (bound from withTable) and the
+// component-states.mjs), variableColors (figma-variables-read.figma.js),
+// checkSpec, checkBuilt, checkExisting (bound from withTable) and the
 // caller-filled slots EXPECT and MODE (passed to runFigmaChecks). The snapshot
 // shape is documented at the top of scripts/lib/figma-checks.mjs.
 
@@ -24,37 +25,6 @@ async function variableName(alias) {
   if (!variable) return null;
   if (variable.resolvedType === 'COLOR') readVariables.set(variable.name, variable);
   return variable.name;
-}
-
-function colorHex(value) {
-  if (!value || typeof value !== 'object' || !('r' in value)) return null;
-  const byte = (x) => Math.round(x * 255).toString(16).padStart(2, '0');
-  const alpha = value.a === undefined ? 1 : value.a;
-  return `#${byte(value.r)}${byte(value.g)}${byte(value.b)}${alpha < 1 ? byte(alpha) : ''}`;
-}
-
-// The value of `variable` in the mode named `modeName` (after the fold), else
-// its collection's default mode, following aliases up to 10 hops.
-async function resolveColor(variable, modeName, hops) {
-  if (!variable || hops > 10) return null;
-  const collection = await figma.variables.getVariableCollectionByIdAsync(variable.variableCollectionId);
-  if (!collection) return null;
-  const mode = collection.modes.find((m) => normalizeName(m.name) === normalizeName(modeName));
-  const value = variable.valuesByMode[mode ? mode.modeId : collection.defaultModeId];
-  if (value && value.type === 'VARIABLE_ALIAS') {
-    return resolveColor(await figma.variables.getVariableByIdAsync(value.id), modeName, hops + 1);
-  }
-  return colorHex(value);
-}
-
-// { modes: { [modeName]: hex | null }, defaultMode } over the variable's own collection.
-async function variableColors(variable) {
-  const collection = await figma.variables.getVariableCollectionByIdAsync(variable.variableCollectionId);
-  if (!collection) return { modes: {}, defaultMode: undefined };
-  const modes = {};
-  for (const mode of collection.modes) modes[mode.name] = await resolveColor(variable, mode.name, 0);
-  const fallback = collection.modes.find((m) => m.modeId === collection.defaultModeId);
-  return { modes, defaultMode: fallback ? fallback.name : undefined };
 }
 
 // The fields the focus check reads from a variant, a control layer or a direct child.
@@ -114,19 +84,45 @@ function groupProperties(set) {
   }
 }
 
-async function readComponentSet(expect) {
-  readVariables.clear();
+// The set a build just made: the COMPONENT_SET in the `WIP: <name>` frame on the
+// current page. A frame holding plain FRAMEs where the set should be is a failed
+// assertion, not a missing target, so it comes back as `{ empty }` for the
+// structural check to name.
+async function findWipSet(expect) {
   await figma.currentPage.loadAsync();
   const frameName = `WIP: ${expect.name}`;
   const frame = figma.currentPage.findOne((n) => n.name === frameName);
   if (!frame) throw new Error(`no node named "${frameName}" on the current page`);
   const set = frame.type === 'COMPONENT_SET' ? frame : (frame.children || []).find((c) => c.type === 'COMPONENT_SET');
-  // A frame holding plain FRAMEs where the set should be is a failed assertion,
-  // not a missing target: report what is there so the structural check names it.
-  if (!set) {
-    const first = (frame.children || [])[0];
-    return { type: first ? first.type : 'NONE', variantGroupProperties: {}, children: [] };
+  if (set) return { set };
+  const first = (frame.children || [])[0];
+  return { empty: { type: first ? first.type : 'NONE', variantGroupProperties: {}, children: [] } };
+}
+
+// A set already in the library: the first COMPONENT_SET whose name folds to the
+// same name. With `pageName`, only that page is loaded (exact name, or a unique
+// match on the trimmed name). Without it every page is loaded in turn until one
+// has the set, which on a miss is the whole file; a whole-file load stalled the
+// bridge on a large file, so callers pass the page.
+async function findExistingSet(name, pageName) {
+  const want = normalizeName(name);
+  let pages = figma.root.children;
+  if (pageName !== undefined && pageName !== null) {
+    const exact = pages.filter((p) => p.name === pageName);
+    const trimmed = pages.filter((p) => p.name.trim() === String(pageName).trim());
+    pages = exact.length ? exact : trimmed.length === 1 ? trimmed : [];
+    if (!pages.length) throw new Error(`no page named "${pageName}"`);
   }
+  for (const page of pages) {
+    await page.loadAsync();
+    const set = page.findAllWithCriteria({ types: ['COMPONENT_SET'] }).find((s) => normalizeName(s.name) === want);
+    if (set) return set;
+  }
+  throw new Error(`no component set named "${name}"${pageName ? ` on page "${pageName}"` : ' in this file'}`);
+}
+
+async function readSet(set, expect) {
+  readVariables.clear();
 
   const isFocusState = (props) =>
     Object.entries(props || {}).some(([k, v]) => {
@@ -169,6 +165,10 @@ async function readComponentSet(expect) {
 
 async function runFigmaChecks(EXPECT, MODE) {
   if (MODE === 'spec') return checkSpec(EXPECT);
-  if (MODE === 'built') return checkBuilt(await readComponentSet(EXPECT), EXPECT);
-  throw new Error(`MODE must be 'spec' or 'built', got ${JSON.stringify(MODE)}`);
+  if (MODE === 'built') {
+    const { set, empty } = await findWipSet(EXPECT);
+    return checkBuilt(set ? await readSet(set, EXPECT) : empty, EXPECT);
+  }
+  if (MODE === 'existing') return checkExisting(await readSet(await findExistingSet(EXPECT.name, EXPECT.page), EXPECT), EXPECT);
+  throw new Error(`MODE must be 'spec', 'built' or 'existing', got ${JSON.stringify(MODE)}`);
 }
