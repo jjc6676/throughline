@@ -345,6 +345,19 @@ function overriddenRecords(instance, path, underDetached) {
   return records;
 }
 
+// The SLOT nodes on this instance's own surface: its slots, and the slots of
+// instances nested in its component, reached only through component sublayers
+// (ids 'I…'). A slot inside content added to a slot is left out here; the walk
+// reaches it through that content.
+function slotsOf(instance) {
+  return instance.findAll((n) => n.type === 'SLOT').filter((slot) => {
+    for (let node = slot.parent; node && node !== instance; node = node.parent) {
+      if (!String(node.id).startsWith('I')) return false;
+    }
+    return true;
+  });
+}
+
 function screensOn(page, names) {
   const all = [];
   for (const top of page.children) {
@@ -405,6 +418,14 @@ async function readScreens(target) {
     if (node.visible === false) return;
     if (node.type === 'INSTANCE') {
       nodes.push(...overriddenRecords(node, path, insideDetached));
+      // Content added to a slot is the screen's own, and isn't listed in
+      // instance.overrides. A slot's placeholder children keep instance-sublayer
+      // ids ('I…;…') and stay part of the component.
+      for (const slot of slotsOf(node)) {
+        for (const child of slot.children) {
+          if (!String(child.id).startsWith('I')) walk(child, `${path} / ${slot.name} / ${child.name}`, false, insideDetached);
+        }
+      }
       return;
     }
     const mixedPaints = node.fills === figma.mixed;

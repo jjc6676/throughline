@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildFigmaChecks, buildFigmaAdherence } from './build-figma-checks.mjs';
+import { buildFigmaChecks, buildFigmaAdherence, buildFigmaCompose } from './build-figma-checks.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const read = (name) => readFileSync(join(HERE, 'lib', name), 'utf8');
@@ -18,6 +18,12 @@ const adherenceSources = () => ({
   checkerSource: read('figma-adherence.mjs'),
   variablesSource: read('figma-variables-read.figma.js'),
   readerSource: read('figma-adherence-read.figma.js'),
+});
+const composeSources = () => ({
+  adherenceSource: read('figma-adherence.mjs'),
+  composeSource: read('figma-compose.mjs'),
+  variablesSource: read('figma-variables-read.figma.js'),
+  writerSource: read('figma-compose.figma.js'),
 });
 const snippetOf = (md) => md.slice(md.lastIndexOf('```js') + '```js'.length, md.lastIndexOf('```'));
 
@@ -102,7 +108,7 @@ function fakeFigma() {
   const scrim = { id: '1:5', name: 'Scrim', type: 'RECTANGLE', visible: true, fills: [solid(0, 0, 0, 0.5)], strokes: [], cornerRadius: 0 };
   const instance = {
     id: '1:6', name: 'Button', type: 'INSTANCE', visible: true, fills: [solid(1, 1, 1)], strokes: [],
-    overrides: [{ id: '1:6', overriddenFields: ['fills'] }], findOne: () => null,
+    overrides: [{ id: '1:6', overriddenFields: ['fills'] }], findOne: () => null, findAll: () => [],
   };
   const screen = { id: '1:2', name: 'Home', type: 'FRAME', visible: true, fills: [], strokes: [], cornerRadius: 0, layoutMode: 'NONE', children: [rect, card, scrim, instance] };
   const page = { name: '  Templates', children: [screen], loadAsync: async () => {}, findOne: () => null };
@@ -135,4 +141,333 @@ test('the inlined adherence snippet runs end to end against a fake Figma', async
   );
   assert.equal(result.failures[0].link, 'https://www.figma.com/design/TEST?node-id=1-3');
   assert.deepEqual(result.advisories.map((a) => a.detail), ['fill #00000080: no colour variable has this value']);
+});
+
+// A fake Figma whose one screen holds a Panel instance with a Body slot. The slot
+// holds an added frame (a plain id) and a placeholder frame (an instance-sublayer
+// id), each with a raw 16 px gap between two children. One GAP variable at 16.
+function fakeSlotFigma() {
+  const leaf = (id) => ({ id, name: 'Row', type: 'FRAME', visible: true, fills: [], strokes: [], layoutMode: 'NONE', children: [] });
+  const stack = (id, name) => ({
+    id, name, type: 'FRAME', visible: true, fills: [], strokes: [], layoutMode: 'VERTICAL', itemSpacing: 16,
+    paddingTop: 0, paddingRight: 0, paddingBottom: 0, paddingLeft: 0, primaryAxisAlignItems: 'MIN',
+    children: [leaf(`${id}a`), leaf(`${id}b`)],
+  });
+  const added = stack('2:1', 'Added');
+  const placeholder = stack('I1:6;9:1', 'Placeholder');
+  const instance = {
+    id: '1:6', name: 'Panel', type: 'INSTANCE', visible: true, fills: [], strokes: [], overrides: [], findOne: () => null,
+  };
+  const slot = { id: 'I1:6;9:0', name: 'Body', type: 'SLOT', parent: instance, children: [added, placeholder] };
+  instance.findAll = (pred) => [slot].filter(pred);
+  const screen = { id: '1:2', name: 'Home', type: 'FRAME', visible: true, fills: [], strokes: [], layoutMode: 'NONE', children: [instance] };
+  const page = { name: 'Templates', children: [screen], loadAsync: async () => {}, findOne: () => null };
+  const white = { id: 'v1', name: 'color/bg/canvas', variableCollectionId: 'c1', valuesByMode: { m: { r: 1, g: 1, b: 1, a: 1 } } };
+  const gap = { id: 'v2', name: 'space/4', scopes: ['GAP'], variableCollectionId: 'c1', valuesByMode: { m: 16 } };
+  return {
+    mixed: Symbol('mixed'),
+    root: { children: [page] },
+    variables: {
+      getLocalVariablesAsync: async (type) => (type === 'COLOR' ? [white] : [gap]),
+      getVariableCollectionByIdAsync: async () => ({ modes: [{ modeId: 'm', name: 'Default' }], defaultModeId: 'm' }),
+      getVariableByIdAsync: async () => null,
+    },
+  };
+}
+
+test('the adherence snippet reads content added to a slot, and skips the placeholder', async () => {
+  const code = snippetOf(buildFigmaAdherence(adherenceSources()));
+  const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor;
+  const run = new AsyncFunction('figma', `${code}\nreturn await runScreenGate({ page: 'Templates', fileKey: 'TEST' }, []);`);
+  const result = await run(fakeSlotFigma());
+  assert.deepEqual(
+    result.failures.map((f) => `${f.rule} | ${f.path} | ${f.detail}`),
+    ['raw-dimension | Templates / Home / Panel / Body / Added | gap 16: bind space/4'],
+  );
+});
+
+test('compose build: inlines its four sources, no module syntax survives, deterministic', () => {
+  const md = buildFigmaCompose(composeSources());
+  assert.match(md, /function resolveScreen\(/);
+  assert.match(md, /function dimensionBuckets\(/);
+  assert.match(md, /async function runCompose\(/);
+  assert.match(md, /GENERATED FILE — do not edit by hand/);
+  assert.ok(!/^\s*(import|export)\b/m.test(snippetOf(md)), 'snippet must contain no import/export lines');
+  assert.throws(() => buildFigmaCompose({ ...composeSources(), composeSource: "import { x } from 'node:fs';\n" }), /import-free/);
+  assert.equal(buildFigmaCompose(composeSources()), buildFigmaCompose(composeSources()));
+});
+
+test('generated compose reference on disk is in sync with the sources', () => {
+  const onDisk = readFileSync(join(HERE, '..', 'references', 'figma-compose.md'), 'utf8');
+  assert.equal(onDisk, buildFigmaCompose(composeSources()), 'run: node scripts/build-figma-checks.mjs');
+});
+
+// A fake Figma just deep enough for the writer, strict where Figma is: HUG
+// throws on a node without auto layout (text excepted), FILL throws under a
+// parent without it. Components: Button (auto layout; variant, text, boolean
+// props), Spinner (no auto layout), Panel (auto layout, a VERTICAL Body slot
+// holding a placeholder), Broken (setProperties throws). It records the calls
+// that matter to the result, in order.
+function fakeComposeFigma({ screens = [] } = {}) {
+  const log = [];
+  let nextId = 100;
+  const node = (type, extra = {}) => {
+    const n = {
+      id: `9:${nextId++}`, type, name: type, x: 0, y: 0, width: 100, height: 100, children: [], parent: null,
+      layoutMode: type === 'FRAME' ? 'NONE' : undefined,
+      plugin: {}, bound: {}, fills: [{ type: 'SOLID', color: { r: 1, g: 1, b: 1 } }], strokes: [], sizing: {},
+      appendChild(c) { if (c.parent) c.remove(); c.parent = n; n.children.push(c); },
+      insertChild(i, c) { if (c.parent) c.remove(); c.parent = n; n.children.splice(i, 0, c); },
+      remove() { const list = n.parent.children; list.splice(list.indexOf(n), 1); n.parent = null; },
+      resize(w, h) { n.width = w; n.height = h; },
+      setBoundVariable(field, v) { n.bound[field] = v.name; },
+      setSharedPluginData(ns, key, value) { n.plugin[`${ns}/${key}`] = value; },
+      getSharedPluginData(ns, key) { return n.plugin[`${ns}/${key}`] || ''; },
+      setExplicitVariableModeForCollection(c, modeId) { log.push(`mode ${c.name}=${modeId}`); },
+      findAll(pred) { const out = []; const walk = (x) => { for (const c of x.children) { if (pred(c)) out.push(c); walk(c); } }; walk(n); return out; },
+      ...extra,
+    };
+    for (const [prop, axis] of [['layoutSizingHorizontal', 'horizontal'], ['layoutSizingVertical', 'vertical']]) {
+      Object.defineProperty(n, prop, {
+        get: () => n.sizing[axis],
+        set: (v) => {
+          const auto = n.layoutMode && n.layoutMode !== 'NONE';
+          if (v === 'HUG' && !auto && n.type !== 'TEXT') throw new Error(`HUG on ${n.type} without auto layout`);
+          if (v === 'FILL' && !(n.parent && n.parent.layoutMode && n.parent.layoutMode !== 'NONE')) throw new Error('FILL without an auto-layout parent');
+          n.sizing[axis] = v;
+        },
+      });
+    }
+    return n;
+  };
+  const makeSet = (name, id, layoutMode, defs, build) => {
+    const variant = node('COMPONENT', { name: 'variant=default', layoutMode });
+    build(variant, 'main');
+    variant.createInstance = () => {
+      const instance = node('INSTANCE', { name, layoutMode });
+      build(instance, 'instance');
+      instance.setProperties = (props) => log.push(`setProperties ${JSON.stringify(props)}`);
+      return instance;
+    };
+    const set = node('COMPONENT_SET', { id, name, defaultVariant: variant, componentPropertyDefinitions: defs });
+    set.appendChild(variant);
+    return set;
+  };
+  const button = makeSet('Button', '1:0', 'HORIZONTAL', {
+    variant: { type: 'VARIANT', variantOptions: ['default', 'secondary'] },
+    'label#1:1': { type: 'TEXT' },
+    'hasIcon#1:2': { type: 'BOOLEAN' },
+  }, (parent) => parent.appendChild(node('TEXT', { name: 'label', fontName: { family: 'Inter', style: 'Medium' }, componentPropertyReferences: { characters: 'label#1:1' } })));
+  const spinner = makeSet('Spinner', '2:0', 'NONE', { size: { type: 'VARIANT', variantOptions: ['sm', 'md'] } }, () => {});
+  const panel = makeSet('Panel', '3:0', 'VERTICAL', { 'Body#3:1': { type: 'SLOT' } }, (parent, kind) => {
+    const slot = node('SLOT', { name: 'Body', layoutMode: 'VERTICAL', componentPropertyReferences: { slotContentId: 'Body#3:1' } });
+    slot.appendChild(node('TEXT', { id: kind === 'instance' ? `I${parent.id};3:2` : '3:2', name: 'placeholder', fontName: { family: 'Inter', style: 'Regular' } }));
+    parent.appendChild(slot);
+  });
+  const broken = makeSet('Broken', '4:0', 'HORIZONTAL', { 'label#4:1': { type: 'TEXT' } }, () => {});
+  broken.defaultVariant.createInstance = () => {
+    const instance = node('INSTANCE', { name: 'Broken', layoutMode: 'HORIZONTAL' });
+    instance.setProperties = () => { throw new Error('setProperties exploded'); };
+    return instance;
+  };
+  const components = node('PAGE', { name: 'Components', loadAsync: async () => {} });
+  for (const set of [button, spinner, panel, broken]) components.appendChild(set);
+  components.findAllWithCriteria = ({ types }) => components.findAll((n) => types.includes(n.type));
+  const screensPage = node('PAGE', { name: 'Screens', loadAsync: async () => {} });
+  for (const s of screens) {
+    const f = node('FRAME', { name: s.name, x: 0, width: 390 });
+    if (s.marked) f.setSharedPluginData('throughline', 'composedScreen', '{}');
+    if (s.inSection) {
+      const section = node('SECTION', { name: 'Flows' });
+      section.appendChild(f);
+      screensPage.appendChild(section);
+    } else screensPage.appendChild(f);
+  }
+  const vars = [
+    { id: 'v1', name: 'space/gap/md', resolvedType: 'FLOAT', scopes: ['GAP'] },
+    { id: 'v2', name: 'color/bg/canvas', resolvedType: 'COLOR', scopes: ['ALL_SCOPES'] },
+  ];
+  const root = node('DOCUMENT');
+  root.appendChild(components);
+  root.appendChild(screensPage);
+  const figma = {
+    mixed: Symbol('mixed'),
+    fileKey: undefined,
+    root,
+    log,
+    createFrame: () => node('FRAME'),
+    createPage: () => { const p = node('PAGE', { loadAsync: async () => {} }); root.appendChild(p); return p; },
+    loadFontAsync: async (f) => log.push(`font ${f.family} ${f.style}`),
+    getLocalTextStylesAsync: async () => [{ id: 'S:1', name: 'Heading/L', fontName: { family: 'Inter', style: 'Bold' } }],
+    variables: {
+      getLocalVariablesAsync: async () => vars,
+      getLocalVariableCollectionsAsync: async () => [{ id: 'C:1', name: 'Color / Semantic', modes: [{ name: 'Light', modeId: 'M:2' }] }],
+      setBoundVariableForPaint: (paint, field, v) => ({ ...paint, bound: v.name }),
+    },
+  };
+  // Text nodes log their characters and take a style through an async setter.
+  figma.createText = () => {
+    const t = node('TEXT');
+    let chars;
+    Object.defineProperty(t, 'characters', { get: () => chars, set: (v) => { chars = v; log.push(`characters ${v}`); } });
+    t.setTextStyleIdAsync = async (id) => { t.textStyleId = id; log.push(`style ${id}`); };
+    return t;
+  };
+  return figma;
+}
+
+async function runComposeSnippet(figma, mode, spec) {
+  const code = snippetOf(buildFigmaCompose(composeSources()));
+  const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor;
+  return new AsyncFunction('figma', `${code}\nreturn await runCompose(${JSON.stringify(mode)}, ${JSON.stringify(spec)});`)(figma);
+}
+
+const composeDescription = (children) => ({
+  screen: 'Sign in', page: 'Screens', width: 390, modes: { 'Color / Semantic': 'Light' },
+  root: { layout: 'vertical', gap: 'space/gap/md', fill: 'color/bg/canvas', children: children ?? [
+    { text: 'Welcome', style: 'Heading/L', color: 'color/bg/canvas' },
+    { component: 'Button', props: { variant: 'Secondary', label: 'Go', hasIcon: true } },
+    { layout: 'horizontal', sizing: { horizontal: 'fill' } },
+  ] },
+});
+const composeBuild = (figma, description) => runComposeSnippet(figma, 'build', { componentsPage: 'Components', description, fileKey: 'TEST' });
+const screensOf = (figma) => figma.root.children.find((p) => p.name === 'Screens');
+
+test('compose build: writes a marked WIP frame with bound values, in one font batch and one style batch', async () => {
+  const figma = fakeComposeFigma();
+  const result = await composeBuild(figma, composeDescription());
+  assert.equal(result.ok, true, JSON.stringify(result.errors));
+  const wip = screensOf(figma).children.find((n) => n.name === 'WIP: Sign in');
+  assert.ok(wip.getSharedPluginData('throughline', 'composedScreen').includes('"screen":"Sign in"'));
+  assert.equal(wip.bound.itemSpacing, 'space/gap/md');
+  assert.deepEqual(wip.fills.map((f) => f.bound), ['color/bg/canvas']);
+  assert.equal(wip.width, 390);
+  const [text, instance, row] = wip.children;
+  assert.equal(text.textStyleId, 'S:1');
+  assert.deepEqual(text.fills.map((f) => f.bound), ['color/bg/canvas']);
+  assert.equal(instance.type, 'INSTANCE');
+  assert.deepEqual(instance.sizing, {}, 'an instance not asked to resize keeps its size');
+  assert.deepEqual(row.fills, [], 'a frame with no fill named has no paint, not Figma\'s default white');
+  assert.deepEqual(row.sizing, { horizontal: 'FILL', vertical: 'HUG' });
+  // Fonts in one batch before any write (Inter Regular, which a new text node
+  // starts in, then the style's and the set's), characters while the text is
+  // still Inter Regular, variant props before the rest, styles after everything.
+  assert.deepEqual(figma.log.filter((l) => !l.startsWith('font')), [
+    'mode Color / Semantic=M:2',
+    'characters Welcome',
+    'setProperties {"variant":"secondary"}',
+    'setProperties {"label#1:1":"Go","hasIcon#1:2":true}',
+    'style S:1',
+  ]);
+  const fonts = figma.log.filter((l) => l.startsWith('font'));
+  assert.deepEqual(fonts.sort(), ['font Inter Bold', 'font Inter Medium', 'font Inter Regular']);
+  assert.ok(figma.log.lastIndexOf(fonts.at(-1)) < figma.log.indexOf('mode Color / Semantic=M:2'));
+  assert.equal(result.link, `https://www.figma.com/design/TEST?node-id=${wip.id.replace(':', '-')}`);
+});
+
+test('compose build: a component without auto layout keeps its size, and hug on it is refused before writing', async () => {
+  const figma = fakeComposeFigma();
+  const ok = await composeBuild(figma, composeDescription([{ component: 'Spinner' }, { component: 'Spinner', sizing: { horizontal: 'fill' } }]));
+  assert.equal(ok.ok, true, JSON.stringify(ok.errors));
+  const [kept, filled] = screensOf(figma).children[0].children;
+  assert.deepEqual(kept.sizing, {});
+  assert.deepEqual(filled.sizing, { horizontal: 'FILL' });
+  const refused = fakeComposeFigma();
+  const res = await composeBuild(refused, composeDescription([{ component: 'Spinner', sizing: { vertical: 'hug' } }]));
+  assert.deepEqual(res.errors.map((e) => e.kind), ['invalid']);
+  assert.equal(screensOf(refused).children.length, 0);
+});
+
+test('compose build: slot content replaces the placeholder in the slot the prop names', async () => {
+  const figma = fakeComposeFigma();
+  const res = await composeBuild(figma, composeDescription([{ component: 'Panel', slots: { Body: [
+    { layout: 'vertical', name: 'Added', sizing: { horizontal: 'fill' } },
+  ] } }]));
+  assert.equal(res.ok, true, JSON.stringify(res.errors));
+  const slot = screensOf(figma).children[0].children[0].children.find((n) => n.type === 'SLOT');
+  assert.deepEqual(slot.children.map((n) => n.name), ['Added']);
+  assert.deepEqual(slot.children[0].sizing, { horizontal: 'FILL', vertical: 'HUG' });
+});
+
+test('compose build: a throw mid-write rolls back the WIP frame and a page it created', async () => {
+  const figma = fakeComposeFigma();
+  await assert.rejects(composeBuild(figma, { ...composeDescription([{ component: 'Broken', props: { label: 'x' } }]), page: 'New page' }), /rolled back, nothing written: setProperties exploded/);
+  assert.deepEqual(figma.root.children.map((p) => p.name), ['Components', 'Screens']);
+  const existing = fakeComposeFigma();
+  await assert.rejects(composeBuild(existing, composeDescription([{ component: 'Broken', props: { label: 'x' } }])), /rolled back/);
+  assert.equal(screensOf(existing).children.length, 0);
+});
+
+test('compose build: a missing component, or a name a person used (in a section too), writes nothing', async () => {
+  const figma = fakeComposeFigma();
+  const missing = await composeBuild(figma, composeDescription([{ component: 'DatePicker' }]));
+  assert.deepEqual(missing.errors.map((e) => e.kind), ['missing-component']);
+  assert.equal(screensOf(figma).children.length, 0);
+  for (const where of [{}, { inSection: true }]) {
+    const taken = fakeComposeFigma({ screens: [{ name: 'Sign in', marked: false, ...where }] });
+    const res = await composeBuild(taken, composeDescription());
+    assert.deepEqual(res.errors.map((e) => e.kind), ['name-taken'], JSON.stringify(where));
+    assert.equal(screensOf(taken).children.length, 1);
+  }
+});
+
+test('compose finalize: replaces a composed screen where it sat (in a section too), refuses one a person made', async () => {
+  for (const where of [{}, { inSection: true }]) {
+    const figma = fakeComposeFigma({ screens: [{ name: 'Sign in', marked: true, ...where }] });
+    await composeBuild(figma, composeDescription());
+    const done = await runComposeSnippet(figma, 'finalize', { page: 'Screens', screen: 'Sign in', fileKey: 'TEST' });
+    assert.equal(done.replaced, true);
+    const page = screensOf(figma);
+    const names = (where.inSection ? page.children[0].children : page.children).map((n) => n.name);
+    assert.deepEqual(names, ['Sign in'], JSON.stringify(where));
+  }
+
+  const person = fakeComposeFigma();
+  await composeBuild(person, composeDescription());
+  const page = screensOf(person);
+  const theirs = person.createFrame();
+  theirs.name = 'Sign in';
+  page.appendChild(theirs);
+  await assert.rejects(runComposeSnippet(person, 'finalize', { page: 'Screens', screen: 'Sign in' }), /wasn't composed by throughline/);
+  assert.deepEqual(page.children.map((n) => n.name).sort(), ['Sign in', 'WIP: Sign in']);
+});
+
+// Panel (1:6) nests a Card instance (a component sublayer, id 'I1:6;5:0') whose
+// Body slot holds a stack someone added (5:5). Panel's own slot holds an added
+// stack (2:1) that itself holds a Tag instance (2:2) with an added stack (2:3) in
+// its slot. Every added stack has a raw 16 px gap; each must fail exactly once.
+function fakeNestedSlotFigma() {
+  const leaf = (id) => ({ id, name: 'Row', type: 'FRAME', visible: true, fills: [], strokes: [], layoutMode: 'NONE', children: [] });
+  const stack = (id, name, extra = []) => ({
+    id, name, type: 'FRAME', visible: true, fills: [], strokes: [], layoutMode: 'VERTICAL', itemSpacing: 16,
+    paddingTop: 0, paddingRight: 0, paddingBottom: 0, paddingLeft: 0, primaryAxisAlignItems: 'MIN',
+    children: [leaf(`${id}a`), leaf(`${id}b`), ...extra],
+  });
+  const link = (parent) => { for (const c of parent.children || []) { c.parent = parent; link(c); } return parent; };
+  const findAll = (n) => (pred) => { const out = []; const walk = (x) => { for (const c of x.children || []) { if (pred(c)) out.push(c); walk(c); } }; walk(n); return out; };
+  const instance = (id, name, children) => { const n = { id, name, type: 'INSTANCE', visible: true, fills: [], strokes: [], overrides: [], findOne: () => null, children }; n.findAll = findAll(n); return n; };
+  const tag = instance('2:2', 'Tag', [{ id: 'I2:2;7:0', name: 'Body', type: 'SLOT', children: [stack('2:3', 'Deepest')] }]);
+  const card = instance('I1:6;5:0', 'Card', [{ id: 'I1:6;5:1', name: 'Body', type: 'SLOT', children: [stack('5:5', 'Nested')] }]);
+  const panel = instance('1:6', 'Panel', [card, { id: 'I1:6;9:0', name: 'Body', type: 'SLOT', children: [stack('2:1', 'Added', [tag])] }]);
+  const screen = link({ id: '1:2', name: 'Home', type: 'FRAME', visible: true, fills: [], strokes: [], layoutMode: 'NONE', children: [panel] });
+  const page = { name: 'Templates', children: [screen], loadAsync: async () => {}, findOne: () => null };
+  const gap = { id: 'v2', name: 'space/4', scopes: ['GAP'], variableCollectionId: 'c1', valuesByMode: { m: 16 } };
+  const white = { id: 'v1', name: 'color/bg/canvas', variableCollectionId: 'c1', valuesByMode: { m: { r: 1, g: 1, b: 1, a: 1 } } };
+  return {
+    mixed: Symbol('mixed'),
+    root: { children: [page] },
+    variables: {
+      getLocalVariablesAsync: async (type) => (type === 'COLOR' ? [white] : [gap]),
+      getVariableCollectionByIdAsync: async () => ({ modes: [{ modeId: 'm', name: 'Default' }], defaultModeId: 'm' }),
+      getVariableByIdAsync: async () => null,
+    },
+  };
+}
+
+test('the adherence snippet reads slots on nested instances, and content in slot content once', async () => {
+  const code = snippetOf(buildFigmaAdherence(adherenceSources()));
+  const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor;
+  const run = new AsyncFunction('figma', `${code}\nreturn await runScreenGate({ page: 'Templates', fileKey: 'TEST' }, []);`);
+  const result = await run(fakeNestedSlotFigma());
+  assert.deepEqual(result.failures.map((f) => f.id).sort(), ['2:1', '2:3', '5:5']);
 });
