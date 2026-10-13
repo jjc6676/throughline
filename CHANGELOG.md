@@ -6,6 +6,40 @@ to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.24.0] — 2026-10-13
+
+0.21.0 checked that every focus state has a ring. It never asked whether anyone
+could see it. Now a Figma build measures each ring against the surfaces it sits
+on, at WCAG's 3:1, in every mode, and stops when it falls short. The first live
+run found a real one: Zygarden's light-mode focus colour is 2.37:1 on its own
+canvas. The same release fixes the focus check for systems that name their focus
+colours like `border-primary-focus`, which it used to reject outright.
+
+### Breaking
+
+- **A focus ring nobody can see now stops a Figma build (#158).** The focus check
+  asked whether a ring exists. Now the same script also asks whether you can see
+  it: each ring colour against each page surface the architect names, at WCAG
+  1.4.11's 3:1, in every mode. Below that, the executor returns `BLOCKED` straight
+  away instead of retrying, because the fix is a token value and no rebuild
+  changes it. Neither the executor nor an inline build will edit a variable to get
+  past it. The architect's spec gains a `surfaces` field, colour-variable names
+  like `color/bg/canvas`. Until a spec names them, the check skips and says so,
+  so a build from an older spec isn't blocked. Surfaces have to be local variables
+  in the file. A pass is recorded as the attested check `focus-contrast`. Measured
+  before it shipped: Zygarden's light-mode ring is 2.37:1 on its canvas, and the
+  sample's ring on its muted surface is 2.997:1, which fails.
+
+### Fixed
+
+- **A focus colour named like `border-primary-focus` now counts as a focus
+  variable.** The focus check only accepted `focus` as a whole `/` segment, so a
+  system that names its roles `interaction/border-primary-focus` or
+  `border/greyscale-focus`, as 01. Design System does, failed every component
+  build however correct the ring was. `focus` now counts as a whole word anywhere
+  in the name, split on `-`, `_`, spaces and camelCase. `color/bg/focused` still
+  doesn't.
+
 ## [0.23.0] — 2026-10-11
 
 The three Figma checks that can stop a build used to be paragraphs the model
