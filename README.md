@@ -73,7 +73,7 @@ Everything above was created during a single working session and synced directly
 
 | | |
 |---|---|
-| **A supported agent** | Required — [Claude Code](https://docs.claude.com/en/docs/claude-code) (native plugin), or **Cursor**, **Codex**, or any **AGENTS.md**-aware agent via `npx @radicool/throughline@0.27.0 init`. |
+| **A supported agent** | Required — [Claude Code](https://docs.claude.com/en/docs/claude-code) (native plugin), or **Cursor**, **Codex**, or any **AGENTS.md**-aware agent via `npx @radicool/throughline@0.28.0 init`. |
 | **Figma** | Required, **desktop app** (the browser version causes connection errors). **Professional plan or higher recommended** — multi-mode variables (Light/Dark, brand themes) need it. |
 | **Figma access token** | Optional — only for the few Figma calls the Desktop Bridge can't make, like reading a published library. Without it, you work through the bridge alone. The setup skill walks you through it; your token stays yours and is never shared in chat. |
 | **GitHub** (or similar) | Optional — only when you're ready to graduate to a real remote repo with PRs and CI. |
@@ -113,6 +113,8 @@ Need a new screen? `/throughline:compose-figma` builds it in Figma from your own
 
 Want it in code instead? `/throughline:compose-code` writes the screen as one React file in your app, using only your components and your tokens. It checks the plan before writing a line, reports any component you don't have rather than building one, and gates the file before handing it over.
 
+Every gap either composer reports gets kept. `/throughline:gap-report` ranks what your screens asked for and didn't get by how many screens asked, and calls out the ones where people keep reaching for something you already have. You decide what to build, what's already covered, and what to drop.
+
 Update anytime with `/plugin marketplace update throughline-marketplace`.
 
 #### Cursor, Codex, or a generic AGENTS.md agent
@@ -120,9 +122,9 @@ Update anytime with `/plugin marketplace update throughline-marketplace`.
 Run the installer in your project — it stamps in the skills, the reference docs, the scripts, and the Figma MCP config for your tool:
 
 ```
-npx @radicool/throughline@0.27.0 init --target=cursor    # → .cursor/rules + .cursor/mcp.json
-npx @radicool/throughline@0.27.0 init --target=codex      # → prompts/ + AGENTS.md index + codex-mcp.toml
-npx @radicool/throughline@0.27.0 init --target=generic    # → skills/ + AGENTS.md index
+npx @radicool/throughline@0.28.0 init --target=cursor    # → .cursor/rules + .cursor/mcp.json
+npx @radicool/throughline@0.28.0 init --target=codex      # → prompts/ + AGENTS.md index + codex-mcp.toml
+npx @radicool/throughline@0.28.0 init --target=generic    # → skills/ + AGENTS.md index
 ```
 
 It's safe to re-run (it merges `AGENTS.md` and `.cursor/mcp.json` non-destructively) and stages everything the skills read into `.throughline/`. Then open the `figma-environment-setup` skill/rule/prompt for your tool to begin. For Codex, add the printed `codex-mcp.toml` block to your Codex config to enable Figma access.
